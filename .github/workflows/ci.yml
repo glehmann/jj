@@ -19,22 +19,10 @@ jobs:
     strategy:
       fail-fast: ${{ github.event_name == 'merge_group' }}
       matrix:
-        build: [windows-x86_64]
+        build: [macos-x86_64]
         include:
         - build: macos-x86_64
-          os: macos-14
-          targets: x86_64-apple-darwin
-          # We pass `--target` here rather than unconditionally for all
-          # platforms because otherwise Rust flag settings are ignored
-          # for build scripts and the like, preventing us from getting
-          # the full benefit from faster linkers.
-          #
-          # See:
-          # * <https://doc.rust-lang.org/1.84.1/cargo/reference/config.html#buildrustflags>
-          # * <https://github.com/rust-lang/cargo/issues/4423>
-          cargo_flags: "--target x86_64-apple-darwin --features vendored-openssl"
-        - build: windows-x86_64
-          os: windows-2022
+          os: macos-13
           cargo_flags: ""
     runs-on: ${{ matrix.os }}
 
