@@ -36,3 +36,4 @@ mod test_signing;
 mod test_ssh_signing;
 mod test_view;
 mod test_workspace;
+mod test_x509_signing;

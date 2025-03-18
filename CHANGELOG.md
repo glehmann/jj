@@ -40,6 +40,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New features
 
+* `jj sign` can now sign with X.509 certificates through the `x509` backend.
+
 * `jj sign` will automatically use the gpg key associated with the author's email
   in the absence of a `signing.key` configuration.
 

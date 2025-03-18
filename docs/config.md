@@ -1184,6 +1184,34 @@ To consider expired keys as invalid you can set:
 backends.gpg.allow-expired-keys = false
 ```
 
+### X.509 Signing
+
+```toml
+[signing]
+behavior = "own"
+backend = "x509"
+## You can set `key` to anything accepted by `gpgsm -u`
+## If not set then defaults to the key associated with `user.email`
+# key = "4ED556E9729E000F"
+# key = "signing@example.com"
+```
+
+By default the X.509 backend will look for a `gpgsm` binary on your path. If you want
+to change the program used or specify a path to `gpgsm` explicitly you can set:
+
+```toml
+[signing]
+backends.x509.program = "gpgsm"
+```
+
+Also by default the X.509 backend will ignore key expiry when verifying commit signatures.
+To consider expired keys as invalid you can set:
+
+```toml
+[signing]
+backends.x509.allow-expired-keys = false
+```
+
 ### SSH Signing
 
 ```toml

@@ -30,6 +30,7 @@ use crate::ssh_signing::SshBackend;
 use crate::store::COMMIT_CACHE_CAPACITY;
 #[cfg(feature = "testing")]
 use crate::test_signing_backend::TestSigningBackend;
+use crate::x509_signing::X509Backend;
 
 /// A status of the signature, part of the [Verification] type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +183,7 @@ impl Signer {
             Box::new(SshBackend::from_settings(settings).map_err(SignInitError::BackendConfig)?),
             #[cfg(feature = "testing")]
             Box::new(TestSigningBackend),
-            // Box::new(X509Backend::from_settings(settings).map_err(..)?),
+            Box::new(X509Backend::from_settings(settings).map_err(SignInitError::BackendConfig)?),
         ];
 
         let main_backend = settings

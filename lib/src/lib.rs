@@ -117,6 +117,7 @@ pub mod union_find;
 pub mod view;
 pub mod working_copy;
 pub mod workspace;
+pub mod x509_signing;
 
 #[cfg(test)]
 mod tests {
