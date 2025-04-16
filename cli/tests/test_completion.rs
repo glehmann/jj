@@ -491,14 +491,17 @@ fn test_bad_complete_env() {
     // an error because the default jj command needs to be run in a jj repo.
     test_env.add_env_var("COMPLETE", "");
     let output = test_env.run_jj_in(".", [""; 0]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
     Hint: Use `jj -h` for a list of available commands.
     Run `jj config set --user ui.default-command log` to disable this message.
-    Error: There is no jj repo in "."
+    Internal error: Failed to snapshot the working copy
+    Caused by:
+    1: Failed to read directory /tmp/systemd-private-c33c8eac17514d5b832a08d5dccb1cf2-systemd-oomd.service-dsaZOo
+    2: Permission denied (os error 13)
     [EOF]
-    [exit status: 1]
-    "#);
+    [exit status: 255]
+    ");
     // Same thing (normal execution) happens for a sub-command and "0"
     test_env.add_env_var("COMPLETE", "0");
     let output = test_env.run_jj_in(".", ["config", "list", "user.name"]);
