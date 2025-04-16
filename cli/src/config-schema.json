@@ -788,7 +788,18 @@
                 "legacy-bookmark-behavior": {
                     "type": "boolean",
                     "description": "If true, bookmarks will move to the second commit instead of the first.",
-                    "default": true
+                    "default": false
+                }
+            }
+        },
+        "squash": {
+            "type": "object",
+            "description": "Settings for jj squash",
+            "properties": {
+                "co-authors": {
+                    "type": "boolean",
+                    "description": "If true, the co-authors will be collected from the source commits.",
+                    "default": false
                 }
             }
         },

@@ -316,8 +316,17 @@ Thanks to the people who made this release happen!
   `%` infix operators.
 
 * Evolution history is now stored in the operation log. `jj evolog` can show
-  associated operations for commits created by new jj versions.
+  associated operations for commits created by new jj.
 
+* `jj split` assigns the change id and the bookmarks of the source revision
+  to the revision with the non-selected changes.
+  You can opt out of this change by setting `split.legacy-bookmark-behavior = true`,
+  but this will likely be removed in a future release.
+
+* `jj squash` stores the co-authors of the squashed commits in the destination
+  commit when using the `--co-authors` command line option or the
+  `squash.co-authors = true` configuration.
+  
 ### Fixed bugs
 
 * Work around a git issue that could cause subprocess operations to hang if the
