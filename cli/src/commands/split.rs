@@ -41,6 +41,7 @@ use crate::cli_util::compute_commit_location;
 use crate::command_error::CommandError;
 use crate::command_error::user_error_with_hint;
 use crate::complete;
+use crate::description_util::TextEditor;
 use crate::description_util::add_config_trailers;
 use crate::description_util::description_template;
 use crate::description_util::edit_description;
@@ -170,23 +171,53 @@ impl SplitArgs {
         let use_move_flags = self.destination.is_some()
             || self.insert_after.is_some()
             || self.insert_before.is_some();
-        let (new_parent_ids, new_child_ids) = if use_move_flags {
-            compute_commit_location(
+        let (position, new_parent_ids, new_child_ids) = if use_move_flags {
+            let (new_parent_ids, new_child_ids) = compute_commit_location(
                 ui,
                 workspace_command,
                 self.destination.as_deref(),
                 self.insert_after.as_deref(),
                 self.insert_before.as_deref(),
                 "split-out commit",
-            )?
+            )?;
+            let target_is_parent_ancestor = new_parent_ids.iter().any(|p| {
+                workspace_command
+                    .repo()
+                    .index()
+                    .is_ancestor(target_commit.id(), p)
+            });
+            let target_is_child_descendant = new_child_ids.iter().any(|c| {
+                workspace_command
+                    .repo()
+                    .index()
+                    .is_ancestor(c, target_commit.id())
+            });
+            let position = if target_is_child_descendant && target_is_parent_ancestor {
+                SelectedPosition::Parallel
+            } else if target_is_parent_ancestor {
+                SelectedPosition::AfterRemaining
+            } else if target_is_child_descendant {
+                SelectedPosition::BeforeRemaining
+            } else {
+                SelectedPosition::Elsewhere
+            };
+            (position, new_parent_ids, new_child_ids)
         } else {
-            Default::default()
+            (
+                if self.parallel {
+                    SelectedPosition::Parallel
+                } else {
+                    SelectedPosition::BeforeRemaining
+                },
+                vec![],
+                vec![],
+            )
         };
         Ok(ResolvedSplitArgs {
             target_commit,
             matcher,
             diff_selector,
-            parallel: self.parallel,
+            position,
             use_move_flags,
             new_parent_ids,
             new_child_ids,
@@ -198,10 +229,18 @@ struct ResolvedSplitArgs {
     target_commit: Commit,
     matcher: Box<dyn Matcher>,
     diff_selector: DiffSelector,
-    parallel: bool,
+    position: SelectedPosition,
     use_move_flags: bool,
     new_parent_ids: Vec<CommitId>,
     new_child_ids: Vec<CommitId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelectedPosition {
+    BeforeRemaining,
+    AfterRemaining,
+    Parallel,
+    Elsewhere,
 }
 
 #[instrument(skip_all)]
@@ -215,7 +254,7 @@ pub(crate) fn cmd_split(
         target_commit,
         matcher,
         diff_selector,
-        parallel,
+        position,
         use_move_flags,
         new_parent_ids,
         new_child_ids,
@@ -229,127 +268,245 @@ pub(crate) fn cmd_split(
     let legacy_bookmark_behavior =
         !use_move_flags && tx.settings().get_bool("split.legacy-bookmark-behavior")?;
 
-    // Create the first commit, which includes the changes selected by the user.
-    let first_commit = {
-        let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-        commit_builder.set_tree_id(target.selected_tree.id());
-        if !legacy_bookmark_behavior {
-            commit_builder
-                // Generate a new change id so that the commit being split doesn't
-                // become divergent.
-                .generate_new_change_id();
+    let selected_commit;
+    let remaining_commit;
+    match position {
+        SelectedPosition::BeforeRemaining => {
+            selected_commit = build_selected_commit(
+                &mut tx,
+                ui,
+                &text_editor,
+                args,
+                position,
+                &target,
+                legacy_bookmark_behavior,
+                None,
+            )?;
+            remaining_commit = build_remaining_commit(
+                &mut tx,
+                ui,
+                &text_editor,
+                args,
+                position,
+                &target,
+                legacy_bookmark_behavior,
+                Some(vec![selected_commit.id().clone()]),
+            )?;
         }
-        let description = if !args.message_paragraphs.is_empty() {
-            let description = join_message_paragraphs(&args.message_paragraphs);
-            if !description.is_empty() {
-                commit_builder.set_description(description);
-                add_config_trailers(ui, &tx, &commit_builder)?
-            } else {
-                description
-            }
-        } else {
-            let new_description = add_config_trailers(ui, &tx, &commit_builder)?;
-            commit_builder.set_description(new_description);
-            let temp_commit = commit_builder.write_hidden()?;
-            let intro = "Enter a description for the selected changes.";
-            let template = description_template(ui, &tx, intro, &temp_commit)?;
-            edit_description(&text_editor, &template)?
-        };
-        commit_builder.set_description(description);
-        commit_builder.write(tx.repo_mut())?
+        SelectedPosition::AfterRemaining => {
+            remaining_commit = build_remaining_commit(
+                &mut tx,
+                ui,
+                &text_editor,
+                args,
+                position,
+                &target,
+                legacy_bookmark_behavior,
+                None,
+            )?;
+            selected_commit = build_selected_commit(
+                &mut tx,
+                ui,
+                &text_editor,
+                args,
+                position,
+                &target,
+                legacy_bookmark_behavior,
+                Some(vec![remaining_commit.id().clone()]),
+            )?;
+        }
+        SelectedPosition::Parallel | SelectedPosition::Elsewhere => {
+            selected_commit = build_selected_commit(
+                &mut tx,
+                ui,
+                &text_editor,
+                args,
+                position,
+                &target,
+                legacy_bookmark_behavior,
+                None,
+            )?;
+            remaining_commit = build_remaining_commit(
+                &mut tx,
+                ui,
+                &text_editor,
+                args,
+                position,
+                &target,
+                legacy_bookmark_behavior,
+                None,
+            )?;
+        }
     };
 
-    // Create the second commit, which includes everything the user didn't
-    // select.
-    let second_commit = {
-        let target_tree = target.commit.tree()?;
-        let new_tree = if parallel {
-            // Merge the original commit tree with its parent using the tree
-            // containing the user selected changes as the base for the merge.
-            // This results in a tree with the changes the user didn't select.
-            target_tree
-                .merge(target.selected_tree.clone(), target.parent_tree.clone())
-                .block_on()?
-        } else {
-            target_tree
-        };
-        let parents = if parallel {
-            target.commit.parent_ids().to_vec()
-        } else {
-            vec![first_commit.id().clone()]
-        };
-        let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
-        commit_builder
-            .set_parents(parents)
-            .set_tree_id(new_tree.id());
-        if legacy_bookmark_behavior {
-            commit_builder
-                // Generate a new change id so that the commit being split doesn't
-                // become divergent.
-                .generate_new_change_id();
-        }
-        let description = if target.commit.description().is_empty() {
-            // If there was no description before, don't ask for one for the
-            // second commit.
-            "".to_string()
-        } else if !args.message_paragraphs.is_empty() {
-            // Just keep the original message unchanged
-            commit_builder.description().to_owned()
-        } else {
-            let new_description = add_config_trailers(ui, &tx, &commit_builder)?;
-            commit_builder.set_description(new_description);
-            let temp_commit = commit_builder.write_hidden()?;
-            let intro = "Enter a description for the remaining changes.";
-            let template = description_template(ui, &tx, intro, &temp_commit)?;
-            edit_description(&text_editor, &template)?
-        };
-        commit_builder.set_description(description);
-        commit_builder.write(tx.repo_mut())?
-    };
-
-    let (first_commit, second_commit, num_rebased) = if use_move_flags {
-        move_first_commit(
+    let (selected_commit, remaining_commit, num_rebased) = if use_move_flags {
+        move_selected_commit(
             &mut tx,
             &target,
-            first_commit,
-            second_commit,
+            selected_commit,
+            remaining_commit,
             new_parent_ids,
             new_child_ids,
+            position,
         )?
     } else {
-        rewrite_descendants(&mut tx, &target, first_commit, second_commit, parallel)?
+        rewrite_descendants(
+            &mut tx,
+            &target,
+            selected_commit,
+            remaining_commit,
+            position,
+        )?
     };
     if let Some(mut formatter) = ui.status_formatter() {
         if num_rebased > 0 {
             writeln!(formatter, "Rebased {num_rebased} descendant commits")?;
         }
         write!(formatter, "Selected changes : ")?;
-        tx.write_commit_summary(formatter.as_mut(), &first_commit)?;
+        tx.write_commit_summary(formatter.as_mut(), &selected_commit)?;
         write!(formatter, "\nRemaining changes: ")?;
-        tx.write_commit_summary(formatter.as_mut(), &second_commit)?;
+        tx.write_commit_summary(formatter.as_mut(), &remaining_commit)?;
         writeln!(formatter)?;
     }
     tx.finish(ui, format!("split commit {}", target.commit.id().hex()))?;
     Ok(())
 }
 
-fn move_first_commit(
+/// Creates the selected changes commit, which includes the changes selected by the user.
+fn build_selected_commit(
+    tx: &mut WorkspaceCommandTransaction,
+    ui: &mut Ui,
+    text_editor: &TextEditor,
+    args: &SplitArgs,
+    position: SelectedPosition,
+    target: &CommitWithSelection,
+    legacy_bookmark_behavior: bool,
+    parents: Option<Vec<CommitId>>,
+) -> Result<Commit, CommandError> {
+    let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
+    if let Some(parents) = parents {
+        commit_builder.set_parents(parents);
+    }
+    match position {
+        SelectedPosition::AfterRemaining => {
+            commit_builder.set_tree_id(target.commit.tree_id().clone())
+        }
+        _ => commit_builder.set_tree_id(target.selected_tree.id()),
+    };
+    if !legacy_bookmark_behavior {
+        commit_builder
+            // Generate a new change id so that the commit being split doesn't
+            // become divergent.
+            .generate_new_change_id();
+    }
+    let description = if !args.message_paragraphs.is_empty() {
+        let description = join_message_paragraphs(&args.message_paragraphs);
+        if !description.is_empty() {
+            commit_builder.set_description(description);
+            add_config_trailers(ui, tx, &commit_builder)?
+        } else {
+            description
+        }
+    } else {
+        let new_description = add_config_trailers(ui, tx, &commit_builder)?;
+        commit_builder.set_description(new_description);
+        let temp_commit = commit_builder.write_hidden()?;
+        let intro = "Enter a description for the selected changes.";
+        let template = description_template(ui, tx, intro, &temp_commit)?;
+        edit_description(text_editor, &template)?
+    };
+    commit_builder.set_description(description);
+    Ok(commit_builder.write(tx.repo_mut())?)
+}
+
+/// Create the remaining changes commit, which includes everything the user didn't
+/// select.
+fn build_remaining_commit(
+    tx: &mut WorkspaceCommandTransaction,
+    ui: &mut Ui,
+    text_editor: &TextEditor,
+    args: &SplitArgs,
+    position: SelectedPosition,
+    target: &CommitWithSelection,
+    legacy_bookmark_behavior: bool,
+    parents: Option<Vec<CommitId>>,
+) -> Result<Commit, CommandError> {
+    let target_tree = target.commit.tree()?;
+    let new_tree = match position {
+        SelectedPosition::BeforeRemaining => target_tree,
+        _ => {
+            // Merge the original commit tree with its parent using the tree
+            // containing the user selected changes as the base for the merge.
+            // This results in a tree with the changes the user didn't select.
+            target_tree
+                .merge(target.selected_tree.clone(), target.parent_tree.clone())
+                .block_on()?
+        }
+    };
+    let mut commit_builder = tx.repo_mut().rewrite_commit(&target.commit).detach();
+    if let Some(parents) = parents {
+        commit_builder.set_parents(parents);
+    }
+    commit_builder.set_tree_id(new_tree.id());
+    if legacy_bookmark_behavior {
+        commit_builder
+            // Generate a new change id so that the commit being split doesn't
+            // become divergent.
+            .generate_new_change_id();
+    }
+    let description = if target.commit.description().is_empty() {
+        // If there was no description before, don't ask for one for the
+        // second commit.
+        "".to_string()
+    } else if !args.message_paragraphs.is_empty() {
+        // Just keep the original message unchanged
+        commit_builder.description().to_owned()
+    } else {
+        let new_description = add_config_trailers(ui, tx, &commit_builder)?;
+        commit_builder.set_description(new_description);
+        let temp_commit = commit_builder.write_hidden()?;
+        let intro = "Enter a description for the remaining changes.";
+        let template = description_template(ui, tx, intro, &temp_commit)?;
+        edit_description(text_editor, &template)?
+    };
+    commit_builder.set_description(description);
+    Ok(commit_builder.write(tx.repo_mut())?)
+}
+
+fn move_selected_commit(
     tx: &mut WorkspaceCommandTransaction,
     target: &CommitWithSelection,
-    mut first_commit: Commit,
-    mut second_commit: Commit,
+    mut selected_commit: Commit,
+    mut remaining_commit: Commit,
     new_parent_ids: Vec<CommitId>,
     new_child_ids: Vec<CommitId>,
+    position: SelectedPosition,
 ) -> Result<(Commit, Commit, usize), CommandError> {
     let mut rewritten_commits: HashMap<CommitId, CommitId> = HashMap::new();
-    rewritten_commits.insert(target.commit.id().clone(), second_commit.id().clone());
-    tx.repo_mut()
-        .transform_descendants(vec![target.commit.id().clone()], async |rewriter| {
+    rewritten_commits.insert(target.commit.id().clone(), remaining_commit.id().clone());
+    tx.repo_mut().transform_descendants(
+        vec![target.commit.id().clone()],
+        async |mut rewriter| {
             let old_commit_id = rewriter.old_commit().id().clone();
+            match position {
+                SelectedPosition::BeforeRemaining | SelectedPosition::Elsewhere => {
+                    // no parent replacement required
+                }
+                SelectedPosition::AfterRemaining => {
+                    rewriter.replace_parent(remaining_commit.id(), [selected_commit.id()]);
+                }
+                SelectedPosition::Parallel => {
+                    rewriter.replace_parent(
+                        remaining_commit.id(),
+                        dbg!([selected_commit.id(), remaining_commit.id()]),
+                    );
+                }
+            }
             let new_commit = rewriter.rebase().await?.write()?;
             rewritten_commits.insert(old_commit_id, new_commit.id().clone());
             Ok(())
-        })?;
+        },
+    )?;
 
     let new_parent_ids: Vec<_> = new_parent_ids
         .iter()
@@ -366,7 +523,7 @@ fn move_first_commit(
         &MoveCommitsLocation {
             new_parent_ids,
             new_child_ids,
-            target: MoveCommitsTarget::Commits(vec![first_commit.id().clone()]),
+            target: MoveCommitsTarget::Commits(vec![selected_commit.id().clone()]),
         },
         &RebaseOptions {
             empty: EmptyBehavior::Keep,
@@ -380,12 +537,14 @@ fn move_first_commit(
     // 1 for the transformation of the original commit to the second commit
     // that was inserted in rewritten_commits
     let mut num_new_rebased = 1;
-    if let Some(RebasedCommit::Rewritten(commit)) = stats.rebased_commits.get(first_commit.id()) {
-        first_commit = commit.clone();
+    if let Some(RebasedCommit::Rewritten(commit)) = stats.rebased_commits.get(selected_commit.id())
+    {
+        selected_commit = commit.clone();
         num_new_rebased += 1;
     }
-    if let Some(RebasedCommit::Rewritten(commit)) = stats.rebased_commits.get(second_commit.id()) {
-        second_commit = commit.clone();
+    if let Some(RebasedCommit::Rewritten(commit)) = stats.rebased_commits.get(remaining_commit.id())
+    {
+        remaining_commit = commit.clone();
     }
 
     let num_rebased = rewritten_commits.len() + stats.rebased_commits.len()
@@ -397,15 +556,15 @@ fn move_first_commit(
             .filter(|(_, rewritten)| stats.rebased_commits.contains_key(rewritten))
             .count();
 
-    Ok((first_commit, second_commit, num_rebased))
+    Ok((selected_commit, remaining_commit, num_rebased))
 }
 
 fn rewrite_descendants(
     tx: &mut WorkspaceCommandTransaction,
     target: &CommitWithSelection,
-    first_commit: Commit,
-    second_commit: Commit,
-    parallel: bool,
+    selected_commit: Commit,
+    remaining_commit: Commit,
+    position: SelectedPosition,
 ) -> Result<(Commit, Commit, usize), CommandError> {
     let legacy_bookmark_behavior = tx.settings().get_bool("split.legacy-bookmark-behavior")?;
     if legacy_bookmark_behavior {
@@ -413,16 +572,18 @@ fn rewrite_descendants(
         // moves any bookmarks pointing to the target commit to the second
         // commit.
         tx.repo_mut()
-            .set_rewritten_commit(target.commit.id().clone(), second_commit.id().clone());
+            .set_rewritten_commit(target.commit.id().clone(), remaining_commit.id().clone());
     }
     let mut num_rebased = 0;
     tx.repo_mut().transform_descendants(
         vec![target.commit.id().clone()],
         async |mut rewriter| {
             num_rebased += 1;
-            if parallel {
-                rewriter
-                    .replace_parent(second_commit.id(), [first_commit.id(), second_commit.id()]);
+            if let SelectedPosition::Parallel = position {
+                rewriter.replace_parent(
+                    remaining_commit.id(),
+                    [selected_commit.id(), remaining_commit.id()],
+                );
             }
             rewriter.rebase().await?.write()?;
             Ok(())
@@ -432,11 +593,11 @@ fn rewrite_descendants(
     // where the target commit is the working copy commit.
     for (name, working_copy_commit) in tx.base_repo().clone().view().wc_commit_ids() {
         if working_copy_commit == target.commit.id() {
-            tx.repo_mut().edit(name.clone(), &second_commit)?;
+            tx.repo_mut().edit(name.clone(), &remaining_commit)?;
         }
     }
 
-    Ok((first_commit, second_commit, num_rebased))
+    Ok((selected_commit, remaining_commit, num_rebased))
 }
 
 /// Prompts the user to select the content they want in the first commit and
