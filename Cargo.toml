@@ -27,6 +27,7 @@ clap = { version = "4.5.51", features = [
     "deprecated",
     "wrap_help",
     "string",
+    "unstable-markdown",
 ] }
 clap_complete = { version = "4.5.60", features = ["unstable-dynamic"] }
 clap_complete_nushell = "4.5.10"
