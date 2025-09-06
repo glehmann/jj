@@ -148,11 +148,11 @@ fn test_alias_calls_help() {
         output.normalize_stdout_with(|s| s.split_inclusive('\n').take(7).collect()), @"
     Jujutsu (An experimental VCS)
 
-    To get started, see the tutorial [`jj help -k tutorial`].
-
-    [`jj help -k tutorial`]: https://docs.jj-vcs.dev/latest/tutorial/
+    To get started, see the tutorial jj help -k tutorial.
 
     Usage: jj [OPTIONS] <COMMAND>
+
+    Commands:
     [EOF]
     ");
 }
